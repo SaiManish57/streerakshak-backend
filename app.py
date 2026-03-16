@@ -1,6 +1,7 @@
 # =============================================================
 #  app.py — STREERAKSHAK Cloud Backend (Railway)
-#  Handles: SOS alerts, GPS tracking, emails, tracking page
+#  Each user sends their own Gmail credentials with SOS
+#  so emails come from THEIR account, not a shared one
 # =============================================================
 
 import os
@@ -33,19 +34,15 @@ log = logging.getLogger(__name__)
 
 # =============================================================
 # CONFIGURATION
-# All values come from Railway environment variables
-# Set these in Railway → Your Project → Variables tab
+# Only non-user-specific values live here as env variables
+# User email credentials come from the app request payload
 # =============================================================
 
-EMAIL_SENDER    = os.environ.get("EMAIL_SENDER",    "your_email@gmail.com")
-EMAIL_PASSWORD  = os.environ.get("EMAIL_PASSWORD",  "your_app_password")
-EMERGENCY_EMAIL = os.environ.get("EMERGENCY_EMAIL", "contact@gmail.com")
-POLICE_EMAIL    = os.environ.get("POLICE_EMAIL",    "police@gmail.com")
-TRACKING_TOKEN  = os.environ.get("TRACKING_TOKEN",  "saima-safe-2024")
 SECRET_KEY      = os.environ.get("SECRET_KEY",      "streerakshak-app-key")
-ADMIN_USER      = os.environ.get("ADMIN_USER",      "admin")
-ADMIN_PASSWORD  = os.environ.get("ADMIN_PASSWORD",  "streerakshak2024")
-PORT            = int(os.environ.get("PORT",         8080))
+TRACKING_TOKEN  = os.environ.get("TRACKING_TOKEN",  "saima-safe-2024")
+ADMIN_USER      = os.environ.get("ADMIN_USER",       "admin")
+ADMIN_PASSWORD  = os.environ.get("ADMIN_PASSWORD",   "streerakshak2024")
+PORT            = int(os.environ.get("PORT",          8080))
 
 # =============================================================
 # GLOBAL STATE
@@ -70,6 +67,10 @@ photo_lock        = threading.Lock()
 sos_log      = []
 sos_log_lock = threading.Lock()
 
+# Track per-session token (so each user's tracking page works)
+active_token = TRACKING_TOKEN
+token_lock   = threading.Lock()
+
 # =============================================================
 # FLASK APP
 # =============================================================
@@ -81,7 +82,6 @@ app = Flask(__name__)
 # =============================================================
 
 def require_auth(f):
-    """Protect admin routes with Basic Auth."""
     @wraps(f)
     def decorated(*args, **kwargs):
         auth = request.authorization
@@ -89,12 +89,11 @@ def require_auth(f):
                 auth.username != ADMIN_USER or
                 auth.password != ADMIN_PASSWORD):
             return ("Authentication required", 401,
-                    {"WWW-Authenticate": 'Basic realm="STREERAKSHAK Admin"'})
+                    {"WWW-Authenticate": 'Basic realm="STREERAKSHAK"'})
         return f(*args, **kwargs)
     return decorated
 
 def require_key(f):
-    """Protect app API routes with secret key."""
     @wraps(f)
     def decorated(*args, **kwargs):
         data = request.get_json(silent=True) or {}
@@ -104,12 +103,12 @@ def require_key(f):
     return decorated
 
 # =============================================================
-# EMAIL HELPERS
+# EMAIL — uses credentials from request payload
 # =============================================================
 
-def build_email(subject, body, to_addr, photo_b64=None):
+def build_email(subject, body, from_addr, to_addr, photo_b64=None):
     msg            = MIMEMultipart()
-    msg["From"]    = EMAIL_SENDER
+    msg["From"]    = from_addr
     msg["To"]      = to_addr
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
@@ -129,19 +128,31 @@ def build_email(subject, body, to_addr, photo_b64=None):
             log.warning(f"Photo attach error: {e}")
     return msg
 
-def send_smtp(msg, to_addr):
+def send_smtp(msg, from_addr, password, to_addr):
+    """Send using the USER'S own Gmail credentials."""
     try:
         server = smtplib.SMTP("smtp.gmail.com", 587)
         server.starttls()
-        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-        server.sendmail(EMAIL_SENDER, to_addr, msg.as_string())
+        server.login(from_addr, password)
+        server.sendmail(from_addr, to_addr, msg.as_string())
         server.quit()
-        log.info(f"Email sent → {to_addr}")
+        log.info(f"Email sent: {from_addr} → {to_addr}")
+    except smtplib.SMTPAuthenticationError:
+        log.error(f"Gmail auth failed for {from_addr} — check App Password")
     except Exception as e:
         log.error(f"Email failed ({to_addr}): {e}")
 
-def dispatch_alerts(location_url, track_url, stream_url, photo_b64=None):
-    """Send SOS emails to emergency contact and police simultaneously."""
+def dispatch_alerts(
+    sender_email, sender_password,
+    emergency_email, police_email,
+    location_url, track_url, stream_url,
+    photo_b64=None
+):
+    """
+    Sends SOS emails FROM the user's own Gmail.
+    Both emergency contact + police receive simultaneously.
+    """
+    base_url = request.host_url.rstrip("/") if request else ""
 
     emergency_body = f"""
 STREERAKSHAK — EMERGENCY SOS ALERT
@@ -179,49 +190,83 @@ IMMEDIATE ASSISTANCE REQUIRED
 Automated alert — STREERAKSHAK Safety System.
 """
 
-    threads = [
-        threading.Thread(
+    threads = []
+
+    # Always send to emergency contact
+    if emergency_email:
+        threads.append(threading.Thread(
             target=send_smtp,
             args=(
                 build_email(
                     "🚨 SOS ALERT — STREERAKSHAK",
-                    emergency_body, EMERGENCY_EMAIL, photo_b64
+                    emergency_body, sender_email,
+                    emergency_email, photo_b64
                 ),
-                EMERGENCY_EMAIL
+                sender_email, sender_password, emergency_email
             ),
             daemon=True
-        ),
-        threading.Thread(
+        ))
+
+    # Send to police if provided
+    if police_email:
+        threads.append(threading.Thread(
             target=send_smtp,
             args=(
                 build_email(
                     "⚠️ WOMEN SAFETY ALERT — Immediate Assistance",
-                    police_body, POLICE_EMAIL, photo_b64
+                    police_body, sender_email,
+                    police_email, photo_b64
                 ),
-                POLICE_EMAIL
+                sender_email, sender_password, police_email
             ),
             daemon=True
-        ),
-    ]
+        ))
+
     for t in threads:
         t.start()
 
 # =============================================================
-# APP API ROUTES (key-protected, called by Android app)
+# APP API ROUTES
 # =============================================================
 
 @app.route("/sos", methods=["POST"])
 @require_key
 def receive_sos():
-    """Called by Android app when SOS is triggered."""
-    global sos_active, EMERGENCY_EMAIL
+    """
+    Called by Android app when SOS is triggered.
+    User's Gmail credentials come in the request payload.
+    """
+    global sos_active, active_token
 
-    data     = request.get_json()
+    data = request.get_json()
+
+    # Location
     lat      = float(data.get("lat",      0.0))
     lon      = float(data.get("lon",      0.0))
     accuracy = float(data.get("accuracy", 0.0))
-    photo    = data.get("photo",  None)
-    email    = data.get("email",  None)
+    photo    = data.get("photo",    None)
+
+    # User's email credentials (from app settings)
+    sender_email    = data.get("sender_email",    "")
+    sender_password = data.get("sender_password", "")
+    emergency_email = data.get("emergency_email", "")
+    police_email    = data.get("police_email",    "")
+
+    # Token (can be per-user)
+    token = data.get("tracking_token", TRACKING_TOKEN)
+
+    # Validate
+    if not sender_email or not sender_password:
+        return jsonify({
+            "status":  "error",
+            "message": "Missing sender email credentials"
+        }), 400
+
+    if not emergency_email:
+        return jsonify({
+            "status":  "error",
+            "message": "Missing emergency contact email"
+        }), 400
 
     # Update location
     with location_lock:
@@ -238,9 +283,11 @@ def receive_sos():
             latest_photo      = photo
             latest_photo_time = time.time()
 
-    # Mark active
+    # Mark active + store token
     with state_lock:
         sos_active = True
+    with token_lock:
+        active_token = token
 
     # Log event
     with sos_log_lock:
@@ -248,37 +295,72 @@ def receive_sos():
             "time": time.strftime("%Y-%m-%d %H:%M:%S"),
             "lat":  lat,
             "lon":  lon,
+            "from": sender_email,
             "type": "SOS_TRIGGER"
         })
         if len(sos_log) > 50:
             sos_log.pop()
 
-    # Override emergency email if app sent a custom one
-    if email and "@" in email:
-        EMERGENCY_EMAIL = email
-
     # Build URLs
     base         = request.host_url.rstrip("/")
     location_url = (f"https://maps.google.com/?q={lat},{lon}"
                     if lat else "Location unavailable")
-    track_url    = f"{base}/track/{TRACKING_TOKEN}"
+    track_url    = f"{base}/track/{token}"
     stream_url   = f"{base}/stream"
 
     # Fire emails in background
     threading.Thread(
         target=dispatch_alerts,
-        args=(location_url, track_url, stream_url, photo),
+        args=(
+            sender_email, sender_password,
+            emergency_email, police_email,
+            location_url, track_url, stream_url, photo
+        ),
         daemon=True
     ).start()
 
-    log.info(f"SOS received: {lat}, {lon}")
+    log.info(f"SOS: {lat},{lon} | from: {sender_email} | to: {emergency_email}")
     return jsonify({"status": "ok", "track_url": track_url})
+
+
+@app.route("/test_email", methods=["POST"])
+@require_key
+def test_email():
+    """
+    Sends a test email to verify Gmail credentials work.
+    Called from Setup screen's 'Send Test Email' button.
+    """
+    data            = request.get_json()
+    sender_email    = data.get("sender_email",    "")
+    sender_password = data.get("sender_password", "")
+    to_email        = data.get("to_email",        "")
+
+    if not all([sender_email, sender_password, to_email]):
+        return jsonify({"success": False, "message": "Missing fields"}), 400
+
+    try:
+        body = """
+STREERAKSHAK — Test Email
+==========================
+
+✅ Your Gmail is configured correctly!
+SOS alerts will be sent from this account.
+
+This is a test email from STREERAKSHAK Safety System.
+"""
+        msg = build_email(
+            "✅ STREERAKSHAK — Email Test Successful",
+            body, sender_email, to_email
+        )
+        send_smtp(msg, sender_email, sender_password, to_email)
+        return jsonify({"success": True, "message": "Test email sent!"})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
 
 
 @app.route("/cancel_sos", methods=["POST"])
 @require_key
 def cancel_sos():
-    """Called by Android app when SOS is cancelled."""
     global sos_active
     with state_lock:
         sos_active = False
@@ -295,26 +377,22 @@ def cancel_sos():
 @app.route("/update_gps", methods=["POST"])
 @require_key
 def update_gps():
-    """Called by Android app every ~30 seconds to push live GPS."""
     data = request.get_json()
     lat  = float(data.get("lat",      0.0))
     lon  = float(data.get("lon",      0.0))
     acc  = float(data.get("accuracy", 0.0))
-
     with location_lock:
         location_data["lat"]          = lat
         location_data["lon"]          = lon
         location_data["accuracy"]     = f"GPS (±{acc:.0f}m)"
         location_data["source"]       = "gps"
         location_data["last_updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
-
     return jsonify({"status": "ok"})
 
 
 @app.route("/upload_photo", methods=["POST"])
 @require_key
 def upload_photo():
-    """Upload a camera snapshot separately after SOS."""
     global latest_photo, latest_photo_time
     data  = request.get_json()
     photo = data.get("photo", None)
@@ -328,7 +406,6 @@ def upload_photo():
 
 @app.route("/status")
 def status():
-    """Health check — used by app and admin dashboard."""
     with state_lock:
         active = sos_active
     with location_lock:
@@ -341,47 +418,39 @@ def status():
         "time":       time.strftime("%Y-%m-%d %H:%M:%S")
     })
 
-# =============================================================
-# STREAM ROUTE — Serves latest phone snapshot
-# =============================================================
 
 @app.route("/stream")
 def stream():
-    """Returns the latest phone camera snapshot as JPEG."""
     with photo_lock:
         photo = latest_photo
     if photo:
         try:
-            img_bytes = base64.b64decode(photo)
             return send_file(
-                BytesIO(img_bytes),
-                mimetype       = "image/jpeg",
-                max_age        = 0,
-                last_modified  = time.time()
+                BytesIO(base64.b64decode(photo)),
+                mimetype      = "image/jpeg",
+                max_age       = 0,
+                last_modified = time.time()
             )
         except Exception as e:
             log.error(f"Stream error: {e}")
-
-    # No photo yet — return placeholder HTML
     return (
-        "<div style='font-family:monospace;color:#666;"
-        "padding:30px;background:#0a0a12;text-align:center'>"
+        "<div style='font-family:monospace;color:#666;padding:30px;"
+        "background:#0a0a12;text-align:center'>"
         "<p style='font-size:2rem'>📵</p>"
-        "<p>No snapshot yet.</p>"
-        "<p style='font-size:0.8rem'>Appears when SOS is triggered.</p>"
-        "</div>",
+        "<p>No snapshot yet — appears when SOS is triggered.</p></div>",
         200
     )
 
 # =============================================================
-# PUBLIC TRACKING ROUTES (token-only, no password)
-# Emergency contacts open these links from the SOS email
+# PUBLIC TRACKING
 # =============================================================
 
 @app.route("/track/<token>")
 def public_track(token):
-    """Tracking page — open on any browser, no login needed."""
-    if token != TRACKING_TOKEN:
+    # Accept both the global token and any active user token
+    with token_lock:
+        current_token = active_token
+    if token != TRACKING_TOKEN and token != current_token:
         abort(403)
     base = request.host_url.rstrip("/")
     return render_template(
@@ -394,8 +463,9 @@ def public_track(token):
 
 @app.route("/public_location/<token>")
 def public_location(token):
-    """Live location API polled by the tracking page."""
-    if token != TRACKING_TOKEN:
+    with token_lock:
+        current_token = active_token
+    if token != TRACKING_TOKEN and token != current_token:
         abort(403)
     with location_lock:
         data = dict(location_data)
@@ -404,19 +474,21 @@ def public_location(token):
     return jsonify(data)
 
 # =============================================================
-# ADMIN DASHBOARD ROUTES (Basic Auth protected)
+# ADMIN DASHBOARD
 # =============================================================
 
 @app.route("/")
 @require_auth
 def dashboard():
     base = request.host_url.rstrip("/")
+    with token_lock:
+        token = active_token
     return render_template(
         "dashboard.html",
-        stream_url      = f"{base}/stream",
-        track_url       = f"{base}/track/{TRACKING_TOKEN}",
-        public_url      = base,
-        tracking_token  = TRACKING_TOKEN
+        stream_url     = f"{base}/stream",
+        track_url      = f"{base}/track/{token}",
+        public_url     = base,
+        tracking_token = token
     )
 
 
@@ -439,8 +511,8 @@ def get_sos_log():
 
 if __name__ == "__main__":
     log.info("=" * 55)
-    log.info("  STREERAKSHAK Cloud Backend Starting...")
-    log.info(f"  Port          : {PORT}")
-    log.info(f"  Tracking token: {TRACKING_TOKEN}")
+    log.info("  STREERAKSHAK Cloud Backend")
+    log.info("  User email credentials sent per-request")
+    log.info(f"  Port: {PORT}")
     log.info("=" * 55)
     app.run(host="0.0.0.0", port=PORT)
